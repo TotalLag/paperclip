@@ -632,6 +632,7 @@ type IssueWakeDiagnosticsWakeRequestRow = {
   claimedAt: Date | null;
   finishedAt: Date | null;
   error: string | null;
+  payload: Record<string, unknown> | null;
 };
 type IssueWakeDiagnosticsActivityRow = {
   action: string;
@@ -5250,6 +5251,7 @@ export function issueService(db: Db) {
           claimedAt: agentWakeupRequests.claimedAt,
           finishedAt: agentWakeupRequests.finishedAt,
           error: agentWakeupRequests.error,
+          payload: agentWakeupRequests.payload,
         })
         .from(agentWakeupRequests)
         .where(
@@ -5501,6 +5503,7 @@ export function issueService(db: Db) {
               wake.claimed_at AS "claimedAt",
               wake.finished_at AS "finishedAt",
               wake.error,
+              wake.payload,
               row_number() OVER (
                 PARTITION BY ${wakeTargetIssueIdSql}
                 ORDER BY wake.requested_at DESC, wake.created_at DESC

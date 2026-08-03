@@ -1034,8 +1034,12 @@ function projectIssueWakeRequest(row: {
   claimedAt: Date | string | null;
   finishedAt: Date | string | null;
   error: string | null;
+  payload: Record<string, unknown> | null;
 }, options: { includeInternalIds: boolean }): IssueWakeDiagnosticWakeRequest {
   const status = projectWakeDiagnosticStatus(row.status);
+  const queueStart = row.payload && typeof row.payload.queueStart === "object" && row.payload.queueStart
+    ? row.payload.queueStart as Record<string, unknown>
+    : null;
   return {
     kind: "wake_request",
     agentId: options.includeInternalIds ? row.agentId : null,
@@ -1048,6 +1052,16 @@ function projectIssueWakeRequest(row: {
     claimedAt: dateToIso(row.claimedAt),
     finishedAt: dateToIso(row.finishedAt),
     failureClass: wakeFailureClass(status, row.error),
+    queueStart: queueStart
+      ? {
+        code: readNonEmptyString(queueStart.code) ?? "unknown",
+        maxConcurrentRuns: typeof queueStart.maxConcurrentRuns === "number" ? queueStart.maxConcurrentRuns : null,
+        runningRuns: typeof queueStart.runningRuns === "number" ? queueStart.runningRuns : null,
+        availableSlots: typeof queueStart.availableSlots === "number" ? queueStart.availableSlots : null,
+        executionRunId: options.includeInternalIds ? readNonEmptyString(queueStart.executionRunId) : null,
+        executionRunStatus: readNonEmptyString(queueStart.executionRunStatus),
+      }
+      : null,
   };
 }
 
@@ -1219,6 +1233,7 @@ function buildIssueWakeDiagnosticsResponse(input: {
     claimedAt: Date | string | null;
     finishedAt: Date | string | null;
     error: string | null;
+    payload: Record<string, unknown> | null;
   }>;
   activityRecords: Array<{
     action: string;
@@ -1303,6 +1318,7 @@ type IssueSubtreeDiagnosticWakeRequestRow = {
   claimedAt: Date | string | null;
   finishedAt: Date | string | null;
   error: string | null;
+  payload: Record<string, unknown> | null;
 };
 
 type IssueSubtreeDiagnosticActivityRow = {

@@ -11661,6 +11661,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  async function recordQueuedRunStartDeferral(input: {
+    agentId: string;
+    maxConcurrentRuns: number;
+    runningRuns: number;
+  }) {
+    const queueStart = {
+      code: "agent_concurrency_limit",
+      maxConcurrentRuns: input.maxConcurrentRuns,
+      runningRuns: input.runningRuns,
+      availableSlots: Math.max(0, input.maxConcurrentRuns - input.runningRuns),
+    };
+    const now = new Date();
+    const queueStartJson = JSON.stringify(queueStart);
+
+    await Promise.all([
+      db
+        .update(heartbeatRuns)
+        .set({
+          resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), '{queueStart}', ${queueStartJson}::jsonb, true)`,
+          updatedAt: now,
+        })
+        .where(and(eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.status, "queued"))),
+      db
+        .update(agentWakeupRequests)
+        .set({
+          payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{queueStart}', ${queueStartJson}::jsonb, true)`,
+          updatedAt: now,
+        })
+        .where(and(eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.status, "queued"))),
+    ]);
+  }
+
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
@@ -11678,7 +11710,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
-      if (availableSlots <= 0) return [];
+      if (availableSlots <= 0) {
+        await recordQueuedRunStartDeferral({
+          agentId,
+          maxConcurrentRuns: policy.maxConcurrentRuns,
+          runningRuns: runningCount,
+        });
+        return [];
+      }
 
       const queuedRuns = await db
         .select()
@@ -15902,6 +15941,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const deferredPayload = {
               ...(payload ?? {}),
               issueId,
+              queueStart: {
+                code: "issue_execution_locked",
+                maxConcurrentRuns: null,
+                runningRuns: null,
+                availableSlots: null,
+                executionRunId: availableActiveExecutionRun.id,
+                executionRunStatus: availableActiveExecutionRun.status,
+              },
               [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
             };
 

@@ -1048,6 +1048,19 @@ export function agentRoutes(
     return trimmed.length > 0 ? trimmed : null;
   }
 
+  function projectQueueStartDiagnostic(value: unknown) {
+    const queueStart = asRecord(asRecord(value)?.queueStart);
+    if (!queueStart) return null;
+    return {
+      code: asNonEmptyString(queueStart.code) ?? "unknown",
+      maxConcurrentRuns: typeof queueStart.maxConcurrentRuns === "number" ? queueStart.maxConcurrentRuns : null,
+      runningRuns: typeof queueStart.runningRuns === "number" ? queueStart.runningRuns : null,
+      availableSlots: typeof queueStart.availableSlots === "number" ? queueStart.availableSlots : null,
+      executionRunId: asNonEmptyString(queueStart.executionRunId),
+      executionRunStatus: asNonEmptyString(queueStart.executionRunStatus),
+    };
+  }
+
   function asEnvBindingString(value: unknown): string | null {
     const direct = asNonEmptyString(value);
     if (direct) return direct;
@@ -3631,6 +3644,7 @@ export function agentRoutes(
       lastOutputStream: heartbeatRuns.lastOutputStream,
       lastOutputBytes: heartbeatRuns.lastOutputBytes,
       processStartedAt: heartbeatRuns.processStartedAt,
+      resultJson: heartbeatRuns.resultJson,
       issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
     };
 
@@ -3666,17 +3680,25 @@ export function agentRoutes(
         .limit(targetRunCount - liveRuns.length);
 
       const rows = [...liveRuns, ...recentRuns];
-      res.json(await Promise.all(rows.map(async (run) => ({
-        ...heartbeat.decorateActiveRunStatus(run),
-        outputSilence: await heartbeat.buildRunOutputSilence(run),
-      }))));
+      res.json(await Promise.all(rows.map(async (run) => {
+        const { resultJson, ...summary } = run;
+        return {
+          ...heartbeat.decorateActiveRunStatus(summary),
+          queueStart: run.status === "queued" ? projectQueueStartDiagnostic(resultJson) : null,
+          outputSilence: await heartbeat.buildRunOutputSilence(summary),
+        };
+      })));
       return;
     }
 
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run),
-      outputSilence: await heartbeat.buildRunOutputSilence(run),
-    }))));
+    res.json(await Promise.all(liveRuns.map(async (run) => {
+      const { resultJson, ...summary } = run;
+      return {
+        ...heartbeat.decorateActiveRunStatus(summary),
+        queueStart: run.status === "queued" ? projectQueueStartDiagnostic(resultJson) : null,
+        outputSilence: await heartbeat.buildRunOutputSilence(summary),
+      };
+    })));
   });
 
   router.get("/heartbeat-runs/:runId", async (req, res) => {
@@ -3845,6 +3867,7 @@ export function agentRoutes(
         lastOutputStream: heartbeatRuns.lastOutputStream,
         lastOutputBytes: heartbeatRuns.lastOutputBytes,
         processStartedAt: heartbeatRuns.processStartedAt,
+        resultJson: heartbeatRuns.resultJson,
       })
       .from(heartbeatRuns)
       .innerJoin(agentsTable, eq(heartbeatRuns.agentId, agentsTable.id))
@@ -3857,10 +3880,14 @@ export function agentRoutes(
       )
       .orderBy(desc(heartbeatRuns.createdAt));
 
-    res.json(await Promise.all(liveRuns.map(async (run) => ({
-      ...heartbeat.decorateActiveRunStatus(run, { companyId: issue.companyId, issueId: issue.id }),
-      outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
-    }))));
+    res.json(await Promise.all(liveRuns.map(async (run) => {
+      const { resultJson, ...summary } = run;
+      return {
+        ...heartbeat.decorateActiveRunStatus(summary, { companyId: issue.companyId, issueId: issue.id }),
+        queueStart: run.status === "queued" ? projectQueueStartDiagnostic(resultJson) : null,
+        outputSilence: await heartbeat.buildRunOutputSilence({ ...summary, companyId: issue.companyId }),
+      };
+    })));
   });
 
   router.get("/issues/:issueId/active-run", async (req, res) => {

@@ -532,6 +532,7 @@ export type {
   IssueBlockerDiagnosticsResponse,
   IssueWakeDiagnosticActivityRecord,
   IssueWakeDiagnosticEvent,
+  IssueWakeDiagnosticQueueStart,
   IssueWakeDiagnosticWakeFailureClass,
   IssueWakeDiagnosticWakeRequest,
   IssueWakeDiagnosticsResponse,
