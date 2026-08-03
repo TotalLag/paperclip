@@ -37,7 +37,13 @@ export async function withAgentStartLock<T>(agentId: string, fn: () => Promise<T
     () => undefined,
     () => undefined,
   );
-  startLocksByAgent.set(agentId, { promise: marker, startedAtMs: Date.now() });
+  // Preserve the age of the oldest lock in the queue. Otherwise each recovery
+  // tick creates a fresh 30-second marker behind the same hung predecessor and
+  // a stranded assignment can remain queued indefinitely.
+  startLocksByAgent.set(agentId, {
+    promise: marker,
+    startedAtMs: previous?.startedAtMs ?? Date.now(),
+  });
   try {
     return await run;
   } finally {

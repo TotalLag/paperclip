@@ -27,4 +27,28 @@ describe("heartbeat agent start lock", () => {
     await expect(secondStartResult).resolves.toBe("started");
     expect(secondStart).toHaveBeenCalledTimes(1);
   });
+
+  it("ages chained waiters from the oldest lock instead of restarting the stale timeout", async () => {
+    vi.useFakeTimers();
+
+    const agentId = randomUUID();
+    const firstStart = vi.fn(() => new Promise<void>(() => undefined));
+    const secondStart = vi.fn(async () => "second");
+    const recoveryStart = vi.fn(async () => "recovered");
+
+    void withAgentStartLock(agentId, firstStart);
+    await Promise.resolve();
+    const secondStartResult = withAgentStartLock(agentId, secondStart);
+
+    await vi.advanceTimersByTimeAsync(29_000);
+    const recoveryStartResult = withAgentStartLock(agentId, recoveryStart);
+    await Promise.resolve();
+    expect(recoveryStart).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(secondStartResult).resolves.toBe("second");
+    await expect(recoveryStartResult).resolves.toBe("recovered");
+    expect(recoveryStart).toHaveBeenCalledTimes(1);
+  });
 });

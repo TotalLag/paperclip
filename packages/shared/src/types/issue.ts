@@ -257,6 +257,15 @@ export interface IssueBlockerDiagnosticsResponse {
 
 export type IssueWakeDiagnosticWakeFailureClass = "failed" | "cancelled" | "skipped";
 
+export interface IssueWakeDiagnosticQueueStart {
+  code: string;
+  maxConcurrentRuns: number | null;
+  runningRuns: number | null;
+  availableSlots: number | null;
+  executionRunId: string | null;
+  executionRunStatus: string | null;
+}
+
 export interface IssueWakeDiagnosticWakeRequest {
   kind: "wake_request";
   agentId: string | null;
@@ -269,6 +278,7 @@ export interface IssueWakeDiagnosticWakeRequest {
   claimedAt: string | null;
   finishedAt: string | null;
   failureClass: IssueWakeDiagnosticWakeFailureClass | null;
+  queueStart: IssueWakeDiagnosticQueueStart | null;
 }
 
 export interface IssueWakeDiagnosticActivityRecord {

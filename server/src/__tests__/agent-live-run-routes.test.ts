@@ -406,6 +406,60 @@ describe("agent live run routes", () => {
     expect(mockHeartbeatService.buildRunOutputSilence).toHaveBeenCalledTimes(50);
   });
 
+  it("exposes a structured reason when a queued run is at the agent concurrency limit", async () => {
+    const rows = [{
+      id: "run-queued",
+      companyId: "company-1",
+      status: "queued",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: null,
+      finishedAt: null,
+      createdAt: new Date("2026-04-10T09:30:00.000Z"),
+      agentId: "agent-1",
+      agentName: "Builder",
+      adapterType: "codex_local",
+      logBytes: 0,
+      livenessState: "healthy",
+      livenessReason: null,
+      continuationAttempt: 0,
+      lastUsefulActionAt: null,
+      nextAction: null,
+      lastOutputAt: null,
+      lastOutputSeq: null,
+      lastOutputStream: null,
+      lastOutputBytes: 0,
+      processStartedAt: null,
+      issueId: "issue-1",
+      resultJson: {
+        queueStart: {
+          code: "agent_concurrency_limit",
+          maxConcurrentRuns: 1,
+          runningRuns: 1,
+          availableSlots: 0,
+        },
+      },
+    }];
+    const { db } = createLiveRunsDbStub(rows);
+
+    const res = await requestApp(
+      await createApp(db),
+      (baseUrl) => request(baseUrl).get("/api/companies/company-1/live-runs"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0]).toMatchObject({
+      id: "run-queued",
+      queueStart: {
+        code: "agent_concurrency_limit",
+        maxConcurrentRuns: 1,
+        runningRuns: 1,
+        availableSlots: 0,
+      },
+    });
+    expect(res.body[0]).not.toHaveProperty("resultJson");
+  });
+
   it("treats explicit zero or invalid live run limit as the capped default", async () => {
     const rows = Array.from({ length: 75 }, (_, index) => ({
       id: `run-${index}`,
