@@ -18,7 +18,9 @@
  *   --source           session source tag for filtering
  */
 
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -207,6 +209,12 @@ export function buildPrompt(
 // Output parsing
 // ---------------------------------------------------------------------------
 
+/** Hermes session IDs are filename/query-safe opaque identifiers. */
+const HERMES_SESSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
+const HERMES_PROFILE_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const HERMES_USAGE_QUERY_TIMEOUT_MS = 1_000;
+const HERMES_USAGE_MAX_OUTPUT_BYTES = 1_024;
+
 /** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
 const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
 
@@ -226,6 +234,177 @@ interface ParsedOutput {
   usage?: UsageSummary;
   costUsd?: number;
   errorMessage?: string;
+}
+
+export interface HermesProfileResolution {
+  profile: string | null;
+  invalid: boolean;
+}
+
+export interface HermesProfileArgsResolution extends HermesProfileResolution {
+  extraArgs: string[];
+}
+
+/**
+ * Normalize profile selectors so Hermes receives one canonical selector at most.
+ * A configured profile and extra-arg profile must agree exactly.
+ */
+export function normalizeHermesProfileArgs(
+  config: Record<string, unknown>,
+  extraArgs?: string[],
+): HermesProfileArgsResolution {
+  const rawConfigProfile = config.profile;
+  if (rawConfigProfile !== undefined &&
+    (typeof rawConfigProfile !== "string" || !HERMES_PROFILE_RE.test(rawConfigProfile))) {
+    return { profile: null, invalid: true, extraArgs: [] };
+  }
+
+  let extraProfile: string | null = null;
+  const normalizedExtraArgs: string[] = [];
+  for (let index = 0; index < (extraArgs?.length ?? 0); index += 1) {
+    const arg = extraArgs![index]!;
+    let value: string | undefined;
+    if (arg === "--profile") {
+      value = extraArgs![index + 1];
+      index += 1;
+    } else if (arg.startsWith("--profile=")) {
+      value = arg.slice("--profile=".length);
+    } else {
+      normalizedExtraArgs.push(arg);
+      continue;
+    }
+
+    if (!value || !HERMES_PROFILE_RE.test(value) || (extraProfile && extraProfile !== value)) {
+      return { profile: null, invalid: true, extraArgs: [] };
+    }
+    extraProfile = value;
+  }
+
+  const configProfile = typeof rawConfigProfile === "string" ? rawConfigProfile : null;
+  if (configProfile && extraProfile && configProfile !== extraProfile) {
+    return { profile: null, invalid: true, extraArgs: [] };
+  }
+
+  return {
+    profile: configProfile ?? extraProfile,
+    invalid: false,
+    extraArgs: normalizedExtraArgs,
+  };
+}
+
+/** Resolve the selected Hermes profile without accepting path-like profile names. */
+export function resolveHermesProfile(
+  config: Record<string, unknown>,
+  extraArgs?: string[],
+): HermesProfileResolution {
+  const { profile, invalid } = normalizeHermesProfileArgs(config, extraArgs);
+  return { profile, invalid };
+}
+
+function isLexicallyContained(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+}
+
+function hasParentTraversal(value: string): boolean {
+  return value.split(/[\\/]+/).includes("..");
+}
+
+/** Resolve the only SQLite database location the adapter is allowed to query. */
+export function resolveHermesUsageDatabasePath(
+  profile: string | null,
+  env: Record<string, string | undefined>,
+): string | null {
+  if (profile !== null && !HERMES_PROFILE_RE.test(profile)) return null;
+  const configuredHome = typeof env.HERMES_HOME === "string" ? env.HERMES_HOME : "";
+  if (configuredHome && (!path.isAbsolute(configuredHome) || hasParentTraversal(configuredHome))) return null;
+  const hermesHome = configuredHome || path.join(os.homedir(), ".hermes");
+  const databasePath = profile
+    ? path.join(hermesHome, "profiles", profile, "state.db")
+    : path.join(hermesHome, "state.db");
+  return isLexicallyContained(hermesHome, databasePath) ? databasePath : null;
+}
+
+/** Reject a state.db symlink (or a symlinked root) that resolves outside HERMES_HOME. */
+export async function isHermesUsageDatabasePathSafe(
+  databasePath: string,
+  env: Record<string, string | undefined>,
+): Promise<boolean> {
+  const configuredHome = typeof env.HERMES_HOME === "string" ? env.HERMES_HOME : "";
+  const hermesHome = configuredHome || path.join(os.homedir(), ".hermes");
+  try {
+    const [resolvedHome, resolvedDatabasePath] = await Promise.all([
+      fs.realpath(hermesHome),
+      fs.realpath(databasePath),
+    ]);
+    return isLexicallyContained(resolvedHome, resolvedDatabasePath);
+  } catch {
+    return false;
+  }
+}
+
+const PYTHON_READ_HERMES_SESSION_USAGE = [
+  "import json, sqlite3, sys",
+  "from pathlib import Path",
+  "try:",
+  "    database_path, session_id = sys.argv[1], sys.argv[2]",
+  "    connection = sqlite3.connect(Path(database_path).as_uri() + '?mode=ro', uri=True, timeout=0.2)",
+  "    connection.execute('PRAGMA busy_timeout = 200')",
+  "    row = connection.execute('SELECT input_tokens, output_tokens, cache_read_tokens FROM sessions WHERE id = ?', (session_id,)).fetchone()",
+  "    connection.close()",
+  "    if row is None:",
+  "        raise ValueError('session missing')",
+  "    print(json.dumps({'inputTokens': row[0], 'outputTokens': row[1], 'cachedInputTokens': row[2]}, separators=(',', ':')))",
+  "except Exception:",
+  "    sys.exit(1)",
+].join("\n");
+
+function isValidUsageValue(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function parseHermesSessionUsage(stdout: string): UsageSummary | null {
+  if (Buffer.byteLength(stdout, "utf8") > HERMES_USAGE_MAX_OUTPUT_BYTES) return null;
+  try {
+    const value = JSON.parse(stdout) as Record<string, unknown>;
+    const inputTokens = value.inputTokens;
+    const outputTokens = value.outputTokens;
+    const cachedInputTokens = value.cachedInputTokens;
+    if (!isValidUsageValue(inputTokens) || !isValidUsageValue(outputTokens) || !isValidUsageValue(cachedInputTokens)) {
+      return null;
+    }
+    if (inputTokens === 0 && outputTokens === 0 && cachedInputTokens === 0) return null;
+    return { inputTokens, outputTokens, cachedInputTokens };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read final cumulative usage after Hermes has exited. The Python program and
+ * SQLite query are fixed; database path and session ID are argv values only.
+ */
+export function readHermesSessionUsage(
+  databasePath: string,
+  sessionId: string,
+  run: typeof spawnSync = spawnSync,
+): UsageSummary | null {
+  if (!path.isAbsolute(databasePath) || !HERMES_SESSION_ID_RE.test(sessionId)) return null;
+  const options: SpawnSyncOptionsWithStringEncoding = {
+    encoding: "utf8",
+    timeout: HERMES_USAGE_QUERY_TIMEOUT_MS,
+    maxBuffer: HERMES_USAGE_MAX_OUTPUT_BYTES,
+    shell: false,
+    windowsHide: true,
+  };
+  try {
+    const result = run("python3", ["-c", PYTHON_READ_HERMES_SESSION_USAGE, databasePath, sessionId], options);
+    if (result.error || result.status !== 0 || result.signal) return null;
+    const stdout = result.stdout || "";
+    return parseHermesSessionUsage(stdout);
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +440,10 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
+function redactHermesSessionIds(value: string): string {
+  return value.replace(/(session[_ ](?:id|saved)[:\s]+)\S+/gi, "$1[redacted]");
+}
+
 function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
@@ -271,7 +454,9 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //   session_id: <id>
   const sessionMatch = stdout.match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch?.[1] ?? null;
+    if (HERMES_SESSION_ID_RE.test(sessionMatch[1])) {
+      result.sessionId = sessionMatch[1];
+    }
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
@@ -280,8 +465,8 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   } else {
     // Legacy format (non-quiet mode)
     const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
-    if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch?.[1] ?? null;
+    if (legacyMatch?.[1] && HERMES_SESSION_ID_RE.test(legacyMatch[1])) {
+      result.sessionId = legacyMatch[1];
     }
     // In non-quiet mode, extract clean response from stdout by
     // filtering out tool lines, system messages, and noise
@@ -313,7 +498,7 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
       .filter((line) => /error|exception|traceback|failed/i.test(line))
       .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
     if (errorLines.length > 0) {
-      result.errorMessage = errorLines.slice(0, 5).join("\n");
+      result.errorMessage = redactHermesSessionIds(errorLines.slice(0, 5).join("\n"));
     }
   }
 
@@ -337,12 +522,33 @@ export async function execute(
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
+  const profileResolution = normalizeHermesProfileArgs(config, extraArgs);
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+
+  if (prevSessionId && !HERMES_SESSION_ID_RE.test(prevSessionId)) {
+    await ctx.onLog("stdout", "[hermes] Warning: invalid Hermes session identifier.\n");
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Invalid Hermes session identifier.",
+    };
+  }
+
+  if (profileResolution.invalid) {
+    await ctx.onLog("stdout", "[hermes] Warning: invalid Hermes profile configuration.\n");
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Invalid Hermes profile configuration.",
+    };
+  }
 
   // ── Resolve provider (defense in depth) ────────────────────────────────
   // Priority chain:
@@ -451,8 +657,11 @@ export async function execute(
     args.push("--resume", prevSessionId);
   }
 
-  if (extraArgs?.length) {
-    args.push(...extraArgs);
+  if (profileResolution.extraArgs.length) {
+    args.push(...profileResolution.extraArgs);
+  }
+  if (profileResolution.profile) {
+    args.push("--profile", profileResolution.profile);
   }
 
   // ── Build environment ──────────────────────────────────────────────────
@@ -493,20 +702,14 @@ export async function execute(
     "stdout",
     `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
-  if (prevSessionId) {
-    await ctx.onLog(
-      "stdout",
-      `[hermes] Resuming session: ${prevSessionId}\n`,
-    );
-  }
-
   // ── Execute ────────────────────────────────────────────────────────────
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
   // Paperclip renders all stderr as red/error in the UI.
   // Wrap onLog to reclassify benign stderr lines as stdout.
   const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+    const redactedChunk = redactHermesSessionIds(chunk);
     if (stream === "stderr") {
-      const trimmed = chunk.trimEnd();
+      const trimmed = redactedChunk.trimEnd();
       // Benign patterns that should NOT appear as errors:
       // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
       // - MCP server registration messages
@@ -518,10 +721,10 @@ export async function execute(
         /tool registered successfully/.test(trimmed) ||
         /Application initialized/.test(trimmed);
       if (isBenign) {
-        return ctx.onLog("stdout", chunk);
+        return ctx.onLog("stdout", redactedChunk);
       }
     }
-    return ctx.onLog(stream, chunk);
+    return ctx.onLog(stream, redactedChunk);
   };
 
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
@@ -540,8 +743,19 @@ export async function execute(
     "stdout",
     `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
   );
+  // Hermes quiet mode omits token accounting from stdout. Once the child has
+  // exited, read the final session totals from the selected profile database.
+  // Failure is deliberately non-fatal and never exposes filesystem or session
+  // details in Paperclip logs.
+  let cumulativeUsage: UsageSummary | null = null;
   if (parsed.sessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    const usageDatabasePath = resolveHermesUsageDatabasePath(profileResolution.profile, env);
+    cumulativeUsage = usageDatabasePath && await isHermesUsageDatabasePathSafe(usageDatabasePath, env)
+      ? readHermesSessionUsage(usageDatabasePath, parsed.sessionId)
+      : null;
+    if (!cumulativeUsage) {
+      await ctx.onLog("stdout", "[hermes] Warning: session usage unavailable.\n");
+    }
   }
 
   // ── Build result ───────────────────────────────────────────────────────
@@ -557,8 +771,17 @@ export async function execute(
     executionResult.errorMessage = parsed.errorMessage;
   }
 
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
+  // Profile DB totals are authoritative. Stdout usage remains the fallback
+  // for older Hermes versions that independently emit it.
+  const usage = cumulativeUsage || parsed.usage || null;
+  const usageBasis = cumulativeUsage
+    ? "session_cumulative"
+    : parsed.usage
+      ? "per_run"
+      : null;
+  if (usage) {
+    executionResult.usage = usage;
+    executionResult.usageBasis = usageBasis!;
   }
 
   if (parsed.costUsd !== undefined) {
@@ -574,7 +797,9 @@ export async function execute(
   executionResult.resultJson = {
     result: parsed.response || "",
     session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
+    usage,
+    usageBasis,
+    usage_basis: usageBasis,
     cost_usd: parsed.costUsd ?? null,
   };
 
