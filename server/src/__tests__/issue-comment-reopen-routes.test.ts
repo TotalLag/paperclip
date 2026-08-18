@@ -398,7 +398,7 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("implicitly reopens closed issues via the PATCH comment path when reassigning to an agent", async () => {
+  it("keeps generic PATCH comments on done issues as evidence without waking the assignee", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("done"),
@@ -407,29 +407,17 @@ describe.sequential("issue comment reopen routes", () => {
 
     const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ comment: "hello", assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+      .send({ comment: "hello" });
 
     expect(res.status).toBe(200);
+    expect(res.body.status).toBe("done");
+    expect(mockIssueService.addComment).toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
-      expect.objectContaining({
-        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
-        status: "todo",
-        actorAgentId: null,
-        actorUserId: "local-board",
-      }),
+      expect.not.objectContaining({ status: "todo" }),
     );
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        action: "issue.updated",
-        details: expect.objectContaining({
-          reopened: true,
-          reopenedFrom: "done",
-          status: "todo",
-        }),
-      }),
-    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("resolves assignee shortnames before updating an issue", async () => {
@@ -510,31 +498,39 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("implicitly reopens closed issues via POST comments when an agent is assigned", async () => {
+  it("keeps generic POST comments on done issues as evidence without waking the assignee", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...makeIssue("done"),
-      ...patch,
-    }));
 
     const res = await request(await installActor(createApp()))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "hello" });
 
     expect(res.status).toBe(201);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      { status: "todo" },
-    );
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("still wakes explicitly mentioned agents for generic terminal comments", async () => {
+    const mentionedAgentId = "44444444-4444-4444-8444-444444444444";
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.findMentionedAgents.mockResolvedValue([mentionedAgentId]);
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "@Reviewer please inspect this archived context." });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
     await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        reason: "issue_reopened_via_comment",
-        payload: expect.objectContaining({
-          reopenedFrom: "done",
-        }),
-      }),
+      mentionedAgentId,
+      expect.objectContaining({ reason: "issue_comment_mentioned" }),
     ));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.anything(),
+    );
   });
 
   it("rejects non-assignee agent POST comments on closed issues", async () => {
@@ -818,39 +814,18 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("moves assigned blocked issues back to todo via POST comments", async () => {
+  it("keeps generic POST comments on blocked issues as evidence without waking the assignee", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...makeIssue("blocked"),
-      ...patch,
-    }));
 
     const res = await request(await installActor(createApp()))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "please continue" });
 
     expect(res.status).toBe(201);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      { status: "todo" },
-    );
-    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        reason: "issue_reopened_via_comment",
-        payload: expect.objectContaining({
-          commentId: "comment-1",
-          reopenedFrom: "blocked",
-          mutation: "comment",
-        }),
-        contextSnapshot: expect.objectContaining({
-          issueId: "11111111-1111-4111-8111-111111111111",
-          wakeCommentId: "comment-1",
-          wakeReason: "issue_reopened_via_comment",
-          reopenedFrom: "blocked",
-        }),
-      }),
-    ));
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("moves in-progress issues with a scheduled retry back to todo via POST human comments", async () => {
@@ -1057,7 +1032,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
-  it("does not move dependency-blocked issues to todo via POST comments", async () => {
+  it("rejects explicit POST resume on blocked issues with unresolved first-class blockers", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.getDependencyReadiness.mockResolvedValue({
       issueId: "11111111-1111-4111-8111-111111111111",
@@ -1070,25 +1045,13 @@ describe.sequential("issue comment reopen routes", () => {
 
     const res = await request(await installActor(createApp()))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
-      .send({ body: "what is happening?" });
+      .send({ body: "what is happening?", resume: true });
 
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("Issue follow-up blocked by unresolved blockers");
     expect(mockIssueService.update).not.toHaveBeenCalled();
-    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        reason: "issue_commented",
-        payload: expect.objectContaining({
-          commentId: "comment-1",
-          mutation: "comment",
-        }),
-        contextSnapshot: expect.objectContaining({
-          issueId: "11111111-1111-4111-8111-111111111111",
-          wakeCommentId: "comment-1",
-          wakeReason: "issue_commented",
-        }),
-      }),
-    ));
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("does not implicitly reopen closed issues via POST comments when no agent is assigned", async () => {
@@ -1156,16 +1119,12 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("still implicitly reopens done issues via POST comments when the comment runId differs from the issue's owning run", async () => {
+  it("keeps generic done comments as evidence even when their run differs from the issue owner", async () => {
     mockIssueService.getById.mockResolvedValue({
       ...makeIssue("done"),
       checkoutRunId: "run-owning",
       executionRunId: "run-owning",
     });
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...makeIssue("done"),
-      ...patch,
-    }));
 
     const res = await request(await installActor(createApp(), {
       type: "board",
@@ -1179,43 +1138,35 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: "Real human follow-up — please reopen" });
 
     expect(res.status).toBe(201);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      { status: "todo" },
-    );
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("does not implicitly reopen done issues via the PATCH comment path when actor runId matches the issue's checkout run", async () => {
-    const issue = {
-      ...makeIssue("done"),
-      checkoutRunId: "run-same-as-actor",
-      executionRunId: null,
-    };
-    mockIssueService.getById.mockResolvedValue(issue);
+  it("keeps generic PATCH comments on cancelled issues as evidence without waking the assignee", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("cancelled"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...issue,
+      ...makeIssue("cancelled"),
       ...patch,
     }));
 
-    const res = await request(await installActor(createApp(), {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-      runId: "run-same-as-actor",
-    }))
+    const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ comment: "Done — final note from the run that owns the issue" });
+      .send({ comment: "Cancelled — archival context only" });
 
     expect(res.status).toBe(200);
-    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+    expect(res.body.status).toBe("cancelled");
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
-      expect.objectContaining({ status: "todo" }),
+      expect.not.objectContaining({ status: "todo" }),
     );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("moves assigned blocked issues back to todo via the PATCH comment path", async () => {
+  it("keeps generic PATCH comments on blocked issues as evidence without waking the assignee", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("blocked"),
@@ -1227,25 +1178,14 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ comment: "please continue" });
 
     expect(res.status).toBe(200);
+    expect(res.body.status).toBe("blocked");
+    expect(mockIssueService.addComment).toHaveBeenCalled();
     expect(mockIssueService.update).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
-      expect.objectContaining({
-        status: "todo",
-        actorAgentId: null,
-        actorUserId: "local-board",
-      }),
+      expect.not.objectContaining({ status: "todo" }),
     );
-    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        reason: "issue_reopened_via_comment",
-        payload: expect.objectContaining({
-          commentId: "comment-1",
-          reopenedFrom: "blocked",
-          mutation: "comment",
-        }),
-      }),
-    ));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("moves in-progress issues with a scheduled retry back to todo via the PATCH comment path", async () => {
@@ -1372,7 +1312,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("does not move dependency-blocked issues to todo via the PATCH comment path", async () => {
+  it("rejects explicit PATCH resume on blocked issues with unresolved first-class blockers", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.getDependencyReadiness.mockResolvedValue({
       issueId: "11111111-1111-4111-8111-111111111111",
@@ -1382,37 +1322,16 @@ describe.sequential("issue comment reopen routes", () => {
       allBlockersDone: false,
       isDependencyReady: false,
     });
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...makeIssue("blocked"),
-      ...patch,
-    }));
 
     const res = await request(await installActor(createApp()))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ comment: "what is happening?" });
+      .send({ comment: "what is happening?", resume: true });
 
-    expect(res.status).toBe(200);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      expect.objectContaining({
-        actorAgentId: null,
-        actorUserId: "local-board",
-      }),
-    );
-    expect(mockIssueService.update).not.toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      expect.objectContaining({ status: "todo" }),
-    );
-    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      "22222222-2222-4222-8222-222222222222",
-      expect.objectContaining({
-        reason: "issue_commented",
-        payload: expect.objectContaining({
-          commentId: "comment-1",
-          mutation: "comment",
-        }),
-      }),
-    ));
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("Issue follow-up blocked by unresolved blockers");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("wakes the assignee when an assigned blocked issue moves back to todo", async () => {
